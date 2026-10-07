@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_name,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -67,6 +68,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        is_unused_weight: Callable[[str], bool] | None = None
+        """If defined, safetensors shards holding only weights whose checkpoint
+        name (before *prefix*) it accepts are not read."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -253,6 +258,10 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        if source.is_unused_weight is not None and use_safetensors:
+            hf_weights_files = filter_safetensors_files_by_weight_name(
+                hf_weights_files, source.is_unused_weight
+            )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -329,6 +338,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 
