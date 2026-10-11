@@ -51,6 +51,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 
+from ..common.engram import ENGRAM_ROW_BLOCK_WEIGHTS
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
     DeepseekV4DecoderLayer,
@@ -284,6 +285,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
     draft_id_to_target_id = None
+    # The draft streams the target checkpoint too; load_weights drops the
+    # engram blocks, but they must arrive in blocks to be streamed at all.
+    row_block_weights = ENGRAM_ROW_BLOCK_WEIGHTS
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

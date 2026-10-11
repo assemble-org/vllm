@@ -122,12 +122,18 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         return hf_weights_files
 
     def _get_weights_iterator(
-        self, model_or_path: str, revision: str | None
+        self,
+        model_or_path: str,
+        revision: str | None,
+        row_block_weights: tuple[str, ...] = (),
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return runai_safetensors_weights_iterator(
-            hf_weights_files, self.load_config.use_tqdm_on_load, self._is_distributed
+            hf_weights_files,
+            self.load_config.use_tqdm_on_load,
+            self._is_distributed,
+            row_block_weights,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -142,7 +148,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
-        yield from self._get_weights_iterator(model_weights, model_config.revision)
+        # A model lists the checkpoint tensors its loaders accept in row blocks.
+        yield from self._get_weights_iterator(
+            model_weights,
+            model_config.revision,
+            getattr(model, "row_block_weights", ()),
+        )
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into a model."""
