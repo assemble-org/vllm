@@ -31,6 +31,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    StageMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
@@ -43,6 +44,7 @@ from vllm.models.deepseek_v4.common.vision import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from ..common.engram import ENGRAM_ROW_BLOCK_WEIGHTS
 from ..common.mm_preprocess import (
     IMAGE,
     IMAGE_END,
@@ -128,6 +130,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
     # bias_vl.
     requires_raw_input_tokens = True
+
+    row_block_weights = ENGRAM_ROW_BLOCK_WEIGHTS
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -328,15 +332,15 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        # AutoWeightsLoader calls the child's load_weights once per contiguous
+        # run of "language_model." weights, and a streaming loader interleaves
+        # them with vision weights. So finalize the fused expert weights once,
+        # here, after every weight is loaded (not in the child's load_weights).
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
+        loaded_params = loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
+        # Under --mm-encoder-only there is no language model to finalize.
+        if not isinstance(self.language_model, StageMissingLayer):
+            self.language_model.process_weights_after_loading()
         self._weights_finalized = True
         return loaded_params
 

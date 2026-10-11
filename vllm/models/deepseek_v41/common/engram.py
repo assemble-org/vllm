@@ -560,15 +560,41 @@ class NgramHashState(nn.Module):
         return output
 
 
+# Checkpoint tensors _engram_head_shard_weight_loader accepts in row blocks.
+# Each engram table is one ~92 GiB tensor, larger than a GPU, so a model that
+# loads them lists these as its `row_block_weights` and the streaming loader
+# delivers them in pieces.
+ENGRAM_ROW_BLOCK_WEIGHTS = (".engram.embed.weight", ".engram.embed.scale")
+
+
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
+    float8_e8m0fnu; keep the raw bytes (the param stores uint8).
+
+    A streaming loader may deliver the table in row blocks, each with
+    ``row_offset`` set to its first row; copy the rows a block shares with
+    this rank's range."""
     part_rows = param.shape[0]
+    first_row = param.engram_vocab_start
+    # Read before .view(), which returns a tensor without the attribute.
+    block_start = getattr(loaded_weight, "row_offset", None)
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
-    shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
+    if block_start is not None:
+        assert loaded_weight.shape[1:] == param.shape[1:], (
+            f"engram block {tuple(loaded_weight.shape)} does not fit param "
+            f"{tuple(param.shape)}"
+        )
+        lo = max(block_start, first_row)
+        hi = min(block_start + loaded_weight.shape[0], first_row + part_rows)
+        if lo < hi:
+            param.data[lo - first_row : hi - first_row].copy_(
+                loaded_weight[lo - block_start : hi - block_start]
+            )
+        return
+    shard = loaded_weight.narrow(0, first_row, part_rows)
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )

@@ -4,6 +4,7 @@
 
 import asyncio
 import concurrent.futures
+import copy
 import fnmatch
 import glob
 import hashlib
@@ -50,9 +51,13 @@ from vllm.utils.import_utils import PlaceholderModule
 
 try:
     from runai_model_streamer import SafetensorsStreamer
+    from runai_model_streamer.safetensors_streamer import safetensors_pytorch
 except ImportError:
     runai_model_streamer = PlaceholderModule("runai_model_streamer")  # type: ignore[assignment]
     SafetensorsStreamer = runai_model_streamer.placeholder_attr("SafetensorsStreamer")
+    safetensors_pytorch = runai_model_streamer.placeholder_attr(
+        "safetensors_streamer.safetensors_pytorch"
+    )
 
 try:
     from fastsafetensors import SingleGroup
@@ -1030,12 +1035,57 @@ def multi_thread_safetensors_weights_iterator(
                 yield key, state_dict.pop(key)
 
 
+# Opted-in tensors larger than this are streamed in row blocks of at most this
+# size, so the streamer never needs a buffer as big as the whole tensor.
+RUNAI_ROW_BLOCK_BYTES = 1 << 30
+_ROW_BLOCK_SEP = "\0"
+
+
+def _split_into_row_blocks(
+    file_requests: list[tuple[int, list, list[int]]],
+    row_block_weights: tuple[str, ...],
+) -> list[tuple[int, list, list[int]]]:
+    """Rewrite the streamer's per-file read plan so that every tensor whose
+    name ends with one of ``row_block_weights`` and is larger than
+    ``RUNAI_ROW_BLOCK_BYTES`` is read as consecutive row blocks, each named
+    ``<name>\\0<first row>``."""
+    split_requests = []
+    for offset, metas, sizes in file_requests:
+        split_metas, split_sizes = [], []
+        for meta, size in zip(metas, sizes, strict=True):
+            if size <= RUNAI_ROW_BLOCK_BYTES or not meta.name.endswith(
+                row_block_weights
+            ):
+                split_metas.append(meta)
+                split_sizes.append(size)
+                continue
+            num_rows = meta.shape[0]
+            row_bytes = size // num_rows
+            rows_per_block = max(1, RUNAI_ROW_BLOCK_BYTES // row_bytes)
+            for start in range(0, num_rows, rows_per_block):
+                block = copy.copy(meta)
+                block.name = f"{meta.name}{_ROW_BLOCK_SEP}{start}"
+                block.shape = [min(rows_per_block, num_rows - start), *meta.shape[1:]]
+                block.offsets = copy.copy(meta.offsets)
+                block.offsets.start = meta.offsets.start + start * row_bytes
+                block.offsets.end = block.offsets.start + block.shape[0] * row_bytes
+                split_metas.append(block)
+                split_sizes.append(block.shape[0] * row_bytes)
+        split_requests.append((offset, split_metas, split_sizes))
+    return split_requests
+
+
 def runai_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     is_distributed: bool = False,
+    row_block_weights: tuple[str, ...] = (),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    A tensor named in ``row_block_weights`` may arrive as several row blocks
+    under its own name, each with ``row_offset`` set to its first row; the
+    model's weight loader for it must accept that."""
     with SafetensorsStreamer() as streamer:
         is_cuda_alike = current_platform.is_cuda_alike()
         device = (
@@ -1044,11 +1094,25 @@ def runai_safetensors_weights_iterator(
             else "cpu"
         )
 
-        streamer.stream_files(
-            hf_weights_files,
-            device=device,
-            is_distributed=is_distributed,
-        )
+        # ponytail: the streamer cannot cap the size of one read, so swap in a
+        # read plan with the big tensors split for this call. Drop this once
+        # the streamer can split a tensor into several reads itself.
+        prepare_request = safetensors_pytorch.prepare_request
+
+        def prepare_split_request(*args, **kwargs):
+            plan = prepare_request(*args, **kwargs)
+            return _split_into_row_blocks(plan, row_block_weights)
+
+        if row_block_weights:
+            safetensors_pytorch.prepare_request = prepare_split_request
+        try:
+            streamer.stream_files(
+                hf_weights_files,
+                device=device,
+                is_distributed=is_distributed,
+            )
+        finally:
+            safetensors_pytorch.prepare_request = prepare_request
         total_tensors = sum(
             len(tensors_meta)
             for tensors_meta in streamer.files_to_tensors_metadata.values()
@@ -1064,7 +1128,11 @@ def runai_safetensors_weights_iterator(
         )
 
         for name, tensor in tensor_iter:
-            yield name, tensor.clone()
+            tensor = tensor.clone()
+            name, _, first_row = name.partition(_ROW_BLOCK_SEP)
+            if first_row:
+                tensor.row_offset = int(first_row)
+            yield name, tensor
 
 
 def fastsafetensors_weights_iterator(
