@@ -696,6 +696,36 @@ def filter_safetensors_files_by_weight_name(
     return kept
 
 
+def filter_safetensors_files_by_index(
+    hf_weights_files: list[str],
+    index_file: str,
+    is_unused_weight: Callable[[str], bool],
+) -> list[str]:
+    """Drop the shards `filter_safetensors_files_by_weight_name` drops, but read
+    the tensor names from the checkpoint index, for shards in object storage,
+    which cannot be opened.
+
+    Shards the index does not list are kept. Returns `hf_weights_files`
+    unchanged when `index_file` is missing or no shard holds a wanted tensor.
+    """
+    if not os.path.isfile(index_file):
+        return hf_weights_files
+    with open(index_file) as f:
+        weight_map = json.load(f)["weight_map"]
+    wanted = {shard for name, shard in weight_map.items() if not is_unused_weight(name)}
+    if not wanted:
+        return hf_weights_files
+    unused = set(weight_map.values()) - wanted
+    kept = [f for f in hf_weights_files if os.path.basename(f) not in unused]
+    if len(kept) < len(hf_weights_files):
+        logger.info_once(
+            "Skipped %d/%d safetensors shard(s) holding no weights the model loads",
+            len(hf_weights_files) - len(kept),
+            len(hf_weights_files),
+        )
+    return kept
+
+
 # explicitly use pure text format, with a newline at the end
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps

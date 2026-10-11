@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import torch
 from torch import nn
@@ -13,6 +13,8 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    filter_safetensors_files_by_index,
+    filter_safetensors_files_by_weight_name,
     runai_safetensors_weights_iterator,
 )
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri, list_safetensors
@@ -122,9 +124,23 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_or_path: str,
         revision: str | None,
         row_block_weights: tuple[str, ...] = (),
+        is_unused_weight: Callable[[str], bool] | None = None,
+        config_dir: str = "",
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_weights_files = self._prepare_weights(model_or_path, revision)
+        if is_unused_weight is not None and is_runai_obj_uri(model_or_path):
+            # Shards in object storage cannot be opened, so read their tensor
+            # names from the index vLLM pulled with the config into `config_dir`.
+            hf_weights_files = filter_safetensors_files_by_index(
+                hf_weights_files,
+                os.path.join(config_dir, SAFE_WEIGHTS_INDEX_NAME),
+                is_unused_weight,
+            )
+        elif is_unused_weight is not None:
+            hf_weights_files = filter_safetensors_files_by_weight_name(
+                hf_weights_files, is_unused_weight
+            )
         return runai_safetensors_weights_iterator(
             hf_weights_files,
             self.load_config.use_tqdm_on_load,
@@ -141,11 +157,14 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
-        # A model lists the checkpoint tensors its loaders accept in row blocks.
+        # A model lists the checkpoint tensors its loaders accept in row blocks,
+        # and a draft model (e.g. an MTP head) names the ones it does not load.
         model.load_weights(
             self._get_weights_iterator(
                 model_weights,
                 model_config.revision,
                 getattr(model, "row_block_weights", ()),
+                getattr(model, "is_unused_checkpoint_weight", None),
+                model_config.model,
             )
         )
