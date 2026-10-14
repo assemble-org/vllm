@@ -346,7 +346,13 @@ class DeepseekV32Model(torch.nn.Module):
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}
+        # AutoWeightsLoader calls this once per contiguous run of `model.*`
+        # names, so a streaming loader can send an FP8 indexer wk and its
+        # scale in different calls (e.g. `lm_head.weight` between them). Keep
+        # the parked halves on the module; completed pairs are popped.
+        _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
+        if _pending_wk_fp8 is None:
+            self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
