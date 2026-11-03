@@ -243,6 +243,28 @@ def test_tiering_spec_create_worker_uses_single_slot_for_replicated_layout(monke
     assert worker_calls[0]["mmap_region"] is region
 
 
+@pytest.mark.parametrize("creator", [False, True])
+def test_tiering_spec_scheduler_drops_region_name_it_joined(monkeypatch, creator):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        cpu_bytes_to_use=SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT * 8,
+        worker_kv_bytes_per_block=SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT,
+    )
+    region = MagicMock(_creator=creator, mmap_path="/dev/shm/vllm_offload_x.mmap")
+    monkeypatch.setattr(
+        tiering_spec_module, "SharedOffloadRegion", lambda **kwargs: region
+    )
+    unlink = MagicMock()
+    monkeypatch.setattr(tiering_spec_module.os, "unlink", unlink)
+
+    spec.get_manager()
+
+    # Joined a region the workers created: drop its name. Created it: keep it.
+    assert unlink.call_args_list == ([] if creator else [((region.mmap_path,),)])
+
+
 def test_tiering_spec_create_worker_uses_worker_rank_for_sharded_layout(monkeypatch):
     import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
 

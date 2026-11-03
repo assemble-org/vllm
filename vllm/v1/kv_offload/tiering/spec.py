@@ -52,6 +52,8 @@ Example out-of-tree tier configuration:
 }
 """
 
+import contextlib
+import os
 from typing import Any
 
 from typing_extensions import override
@@ -357,6 +359,13 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     cpu_page_size=self.cpu_page_size_per_worker,
                 )
                 self._scheduler_mmap = scheduler_mmap
+                # Backport of vLLM #57422 for one-engine launches: every
+                # worker mapped this region before the scheduler joins it,
+                # so drop the name; the mappings stay valid, and a restarted
+                # container finds /dev/shm empty instead of full.
+                if not scheduler_mmap._creator:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(scheduler_mmap.mmap_path)
 
                 # Create primary tier (CPU-based)
                 primary_tier = CPUPrimaryTierOffloadingManager(
