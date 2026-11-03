@@ -49,6 +49,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs.evictor import FsTierEvictor
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
@@ -60,6 +61,13 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+
+def _exists(paths: list[str]) -> Iterable[bool]:
+    if _HAS_BATCH_LOOKUP_C:
+        # C extension: GIL released for the entire faccessat() batch.
+        return batch_lookup_C(paths)
+    return (os.path.exists(p) for p in paths)
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -76,11 +84,7 @@ class FsAsyncLookupManager(AsyncLookupManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
-        if _HAS_BATCH_LOOKUP_C:
-            # C extension: GIL released for the entire faccessat() batch.
-            return batch_lookup_C(paths)
-        return (os.path.exists(p) for p in paths)
+        return _exists([self._tier.file_mapper.get_file_name(k) for k in keys])
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -117,6 +121,9 @@ class FileSystemTierManager(SecondaryTierManager):
         enable_kv_events: bool = False,
         locality: str | None = None,
         backpressure_detector: BackpressureDetector | None = None,
+        max_bytes: int = 0,
+        min_free_bytes: int = 0,
+        eviction_ratio: float = 0.9,
     ):
         """Args:
         offloading_spec: Contains normalized offloading configuration and
@@ -132,6 +139,13 @@ class FileSystemTierManager(SecondaryTierManager):
         locality: Whether this tier's storage is LOCAL or REMOTE relative
             to the publishing vLLM instance.
         backpressure_detector: Optional backpressure detector.
+        max_bytes: Cap on the bytes of this engine's block files; a full cap
+            evicts the least recently used files. 0 (default): no cap. The
+            engine must be the only writer of its block directory, so with
+            data parallel > 1 give each replica its own root_dir.
+        min_free_bytes: Skip a block rather than leave less than this much
+            of the filesystem free. 0 (default): no floor.
+        eviction_ratio: A full cap evicts down to this share of max_bytes.
 
         """
         super().__init__(
@@ -200,6 +214,19 @@ class FileSystemTierManager(SecondaryTierManager):
                 tier_type,
             )
 
+        # ponytail: KV events still report every block a store job was given;
+        # blocks the cap skipped or evicted emit no removed event.
+        self._evictor = (
+            FsTierEvictor(
+                f"{self.file_mapper.base_path}_r{self.file_mapper.rank}",
+                max_bytes,
+                min_free_bytes,
+                eviction_ratio,
+            )
+            if max_bytes or min_free_bytes
+            else None
+        )
+
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
@@ -224,14 +251,19 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
-        task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
-            self._primary_kv_view,
-            [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
-            self._block_size,
-            self._use_o_direct,
-        )
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+        if self._evictor is None:
+            task = functools.partial(
+                batch_store_block,
+                paths,
+                self._primary_kv_view,
+                offsets,
+                self._block_size,
+                self._use_o_direct,
+            )
+        else:
+            task = functools.partial(self._capped_store, paths, offsets)
         self._job_block_counts[job_metadata.job_id] = len(keys)
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -247,6 +279,9 @@ class FileSystemTierManager(SecondaryTierManager):
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
+            if self._evictor is not None:
+                for path in paths:
+                    self._evictor.touch(path, wait=False)
             try:
                 batch_load_block(
                     paths,
@@ -274,6 +309,40 @@ class FileSystemTierManager(SecondaryTierManager):
                 raise
 
         self._pool.enqueue_load(job_id, 1, [load_task])
+
+    def _capped_store(self, paths: list[str], offsets: list[int]) -> None:
+        """Store task under a size cap; runs on a pool thread. A file already
+        on disk only moves forward; a block the evictor refuses is skipped."""
+        evictor = self._evictor
+        assert evictor is not None
+        # Touch every block already on disk before any reserve can evict it.
+        missing = [
+            (path, offset)
+            for path, offset, found in zip(paths, offsets, _exists(paths))
+            if not (found and evictor.touch(path))
+        ]
+        todo = [
+            (path, offset)
+            for path, offset in missing
+            if evictor.reserve(path, self._block_size)
+        ]
+        if not todo:
+            return
+        try:
+            batch_store_block(
+                [path for path, _ in todo],
+                self._primary_kv_view,
+                [offset for _, offset in todo],
+                self._block_size,
+                self._use_o_direct,
+            )
+        except BaseException:
+            # The batch stops at the first error; keep what landed.
+            for path, _ in todo:
+                (evictor.commit if os.path.exists(path) else evictor.abort)(path)
+            raise
+        for path, _ in todo:
+            evictor.commit(path)
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
