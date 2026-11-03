@@ -102,6 +102,8 @@ class _TextModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(num_attention_heads=64)
+        # process_weights_after_loading reads it; no Engram THP here.
+        self.vllm_config = SimpleNamespace(engram_config=None)
         self.quant_config = None
         self.use_sequence_parallel = False
         self.norm = nn.Module()
